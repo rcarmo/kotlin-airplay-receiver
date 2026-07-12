@@ -79,17 +79,50 @@ jobs:
           mkdir -p dist
           cp app/build/outputs/apk/release/app-release.apk dist/Receiver-release.apk
 
-      - name: Upload release APK
+      - name: Upload ordinary CI APK
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v6
         with:
           name: Receiver-release-apk
           path: dist/Receiver-release.apk
           if-no-files-found: error
+          retention-days: 3
 
-      - name: Publish GitHub Release
+      - name: Publish durable tagged APK
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v3
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "Receiver $GITHUB_REF_NAME"
+          gh release upload "$GITHUB_REF_NAME" dist/Receiver-release.apk --clobber
+
+      - name: Keep at most 10 asset-backed Releases
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/github-script@v9
         with:
-          name: Receiver ${{ github.ref_name }}
-          files: dist/Receiver-release.apk
-          generate_release_notes: true
+          script: |
+            const { owner, repo } = context.repo;
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+            const published = releases
+              .filter((release) => !release.draft)
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            const retained = published.slice(0, 10);
+            if (retained.some((release) => !release.assets?.length)) {
+              core.warning('A retained Release has no durable assets; skipping Release pruning.');
+              return;
+            }
+            for (const release of published.slice(10)) {
+              core.info(`Deleting old Release ${release.tag_name} (${release.id}).`);
+              await github.rest.repos.deleteRelease({ owner, repo, release_id: release.id });
+              if (!release.tag_name) continue;
+              try {
+                await github.rest.git.deleteRef({ owner, repo, ref: `tags/${release.tag_name}` });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            }
