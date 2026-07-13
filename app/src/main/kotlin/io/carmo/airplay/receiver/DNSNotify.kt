@@ -10,20 +10,21 @@ import java.util.Locale
 import java.util.concurrent.locks.ReentrantLock
 
 class DNSNotify(
-    context: Context,
+    private val context: Context,
     private val onStatusChanged: (String) -> Unit = {}
 ) {
 
     private val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
     private var airplayRegister: NsdRegister? = null
     private var raopRegister: NsdRegister? = null
-    val deviceName: String = resolveDeviceName(context)
-    private val macAddress: String = NetUtils.localMacAddress()
+    val deviceName: String get() = resolveDeviceName(context)
+    private val macAddress: String get() = ReceiverIdentity.receiverId(context)
     private var airplayStatus: String = "AirPlay idle"
     private var raopStatus: String = "RAOP idle"
 
     fun registerAirplay(port: Int) {
         Log.d(TAG, "registerAirplay port = $port, macAddress = $macAddress")
+        val serviceName = airplayServiceName()
         val attributes = mapOf(
             "deviceid" to macAddress,
             "features" to "0x5A7FFFF7,0x1E",
@@ -31,18 +32,18 @@ class DNSNotify(
             "flags" to "0x4",
             "vv" to "2",
             "model" to "AppleTV2,1",
-            "pw" to "false",
+            "pw" to ReceiverPreferences.requiresPairingPassword(context).toString(),
             "rhd" to "5.6.0.0",
             "pk" to "b07727d6f6cd6e08b58ede525ec3cdeaa252ad9f683feb212ef8a205246554e7",
             "pi" to "2e388006-13ba-4041-9a67-25dd4a43d536"
         )
         val serviceType = "_airplay._tcp."
-        if (airplayRegister?.matches(deviceName, serviceType, port, attributes) == true) {
+        if (airplayRegister?.matches(serviceName, serviceType, port, attributes) == true) {
             return
         }
         airplayRegister?.stop()
         updateRegistrationStatus(AIRPLAY_LABEL, "AirPlay announcing on port $port")
-        airplayRegister = NsdRegister(nsdManager, deviceName, serviceType, port, attributes, AIRPLAY_LABEL, ::updateRegistrationStatus)
+        airplayRegister = NsdRegister(nsdManager, serviceName, serviceType, port, attributes, AIRPLAY_LABEL, ::updateRegistrationStatus)
     }
 
     fun registerRaop(port: Int) {
@@ -54,7 +55,7 @@ class DNSNotify(
             "ft" to "0x5A7FFFF7,0x1E",
             "am" to "AppleTV2,1",
             "rhd" to "5.6.0.0",
-            "pw" to "false",
+            "pw" to ReceiverPreferences.requiresPairingPassword(context).toString(),
             "sv" to "false",
             "tp" to "UDP",
             "txtvers" to "1",
@@ -63,7 +64,9 @@ class DNSNotify(
             "vn" to "65537",
             "pk" to "b07727d6f6cd6e08b58ede525ec3cdeaa252ad9f683feb212ef8a205246554e7",
             "ch" to "2",
-            "cn" to "0,1,2,3",
+            // ALAC is required for Apple Music audio-only; AAC-ELD remains
+            // available for clients that negotiate it explicitly.
+            "cn" to "1,3",
             "md" to "0,1,2",
             "sr" to "44100",
             "ss" to "16"
@@ -79,7 +82,7 @@ class DNSNotify(
     }
 
     private fun raopServiceName(): String {
-        val prefix = "${macAddress.replace(":", "")}@"
+        val prefix = ReceiverIdentity.raopPrefix(context)
         val maxNameLength = (MAX_SERVICE_NAME_LENGTH - prefix.length).coerceAtLeast(1)
         val name = if (deviceName.length > maxNameLength) {
             deviceName.substring(0, maxNameLength)
@@ -87,6 +90,17 @@ class DNSNotify(
             deviceName
         }
         return "$prefix$name"
+    }
+
+    private fun airplayServiceName(): String {
+        // The AirPlay service name must be distinct from the RAOP service name
+        // and from other _airplay._tcp services on the same network.
+        return if (deviceName.endsWith(AIRPLAY_SERVICE_SUFFIX, ignoreCase = true)) {
+            deviceName.take(MAX_SERVICE_NAME_LENGTH)
+        } else {
+            val maxBaseNameLength = (MAX_SERVICE_NAME_LENGTH - AIRPLAY_SERVICE_SUFFIX.length).coerceAtLeast(1)
+            "${deviceName.take(maxBaseNameLength).trimEnd()}$AIRPLAY_SERVICE_SUFFIX"
+        }
     }
 
     private fun updateRegistrationStatus(label: String, status: String) {
@@ -221,8 +235,16 @@ class DNSNotify(
         private const val AIRPLAY_LABEL = "AirPlay"
         private const val RAOP_LABEL = "RAOP"
         private const val MAX_SERVICE_NAME_LENGTH = 63
+        private const val AIRPLAY_SERVICE_SUFFIX = " AirPlay"
+
+        fun suggestedDeviceName(context: Context): String = resolveDeviceName(context)
 
         private fun resolveDeviceName(context: Context): String {
+            val customName = ReceiverPreferences.customDeviceName(context)
+            if (customName.isUsableName()) {
+                return customName!!.sanitizeServiceName()
+            }
+
             val configuredName = Settings.Global.getString(context.contentResolver, "device_name")
             if (configuredName.isUsableName()) {
                 return configuredName.sanitizeServiceName()

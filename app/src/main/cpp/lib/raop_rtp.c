@@ -183,6 +183,15 @@ raop_rtp_destroy(raop_rtp_t *raop_rtp)
     }
 }
 
+int
+raop_rtp_configure_audio(raop_rtp_t *raop_rtp, const raop_audio_config_t *config)
+{
+    if (!raop_rtp || !raop_rtp->buffer || !config) {
+        return -1;
+    }
+    return raop_buffer_configure_audio(raop_rtp->buffer, config);
+}
+
 static int
 raop_rtp_resend_callback(void *opaque, unsigned short seqnum, unsigned short count)
 {
@@ -510,7 +519,7 @@ raop_rtp_thread_udp(void *arg)
                 /* Decode all frames in queue */
                 while ((audiobuf = raop_buffer_dequeue(raop_rtp->buffer, &audiobuflen, &pts, no_resend))) {
                     pcm_data_struct pcm_data;
-                    pcm_data.data_len = 960;
+                    pcm_data.data_len = audiobuflen / (int)sizeof(unsigned short);
                     pcm_data.data = audiobuf;
                     pcm_data.pts = pts;
                     raop_rtp->callbacks.audio_process(raop_rtp->callbacks.cls, &pcm_data);

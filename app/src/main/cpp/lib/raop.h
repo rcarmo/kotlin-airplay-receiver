@@ -35,6 +35,7 @@ struct raop_callbacks_s {
     void  (*video_process)(void *cls, h264_decode_struct *data);
 	int   (*video_width)(void *cls);
 	int   (*video_height)(void *cls);
+	int   (*sender_should_connect)(void *cls, const char *sender_id, const char *display_name);
 	void  (*stream_stopped)(void *cls);
 
 	/* Optional but recommended callback functions */

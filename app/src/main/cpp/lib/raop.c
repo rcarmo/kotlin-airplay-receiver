@@ -76,6 +76,7 @@ static void raop_add_active_mirror(raop_t *raop, raop_rtp_mirror_t *mirror);
 static void raop_remove_active_rtp(raop_t *raop, raop_rtp_t *rtp);
 static void raop_remove_active_mirror(raop_t *raop, raop_rtp_mirror_t *mirror);
 static void conn_notify_stream_status(raop_conn_t *conn, const char *status);
+static void raop_address_to_string(const unsigned char *address, int address_len, char *out, int out_len);
 
 #include "raop_handlers.h"
 
@@ -159,6 +160,26 @@ conn_notify_stream_status(raop_conn_t *conn, const char *status)
 }
 
 static void
+raop_address_to_string(const unsigned char *address, int address_len, char *out, int out_len)
+{
+	if (!address || !out || out_len <= 0) {
+		return;
+	}
+	if (address_len == 4) {
+		snprintf(out, out_len, "%u.%u.%u.%u", address[0], address[1], address[2], address[3]);
+	} else if (address_len == 16) {
+		snprintf(out, out_len,
+		         "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+		         address[0], address[1], address[2], address[3],
+		         address[4], address[5], address[6], address[7],
+		         address[8], address[9], address[10], address[11],
+		         address[12], address[13], address[14], address[15]);
+	} else {
+		snprintf(out, out_len, "unknown");
+	}
+}
+
+static void
 conn_notify_stream_stopped(raop_conn_t *conn)
 {
 	if (!conn || conn->stream_stopped_notified) {
@@ -235,8 +256,15 @@ conn_init(void *opaque, unsigned char *local, int locallen, unsigned char *remot
 {
 	raop_t *raop = opaque;
 	raop_conn_t *conn;
+	char remote_id[64] = {0};
 
 	assert(raop);
+	raop_address_to_string(remote, remotelen, remote_id, sizeof(remote_id));
+	if (raop->callbacks.sender_should_connect &&
+	    !raop->callbacks.sender_should_connect(raop->callbacks.cls, remote_id, remote_id)) {
+		logger_log(raop->logger, LOGGER_WARNING, "Rejected sender %s", remote_id);
+		return NULL;
+	}
 
 	conn = calloc(1, sizeof(raop_conn_t));
 	if (!conn) {

@@ -26,13 +26,15 @@ class AirPlayServer {
 
         val socket = serverSocket ?: return
         serverThread = Thread({
-            try {
-                socket.accept().use {
-                    Log.d(TAG, "received accept")
-                }
-            } catch (e: IOException) {
-                if (serverSocket != null) {
-                    e.printStackTrace()
+            while (serverSocket != null && !Thread.currentThread().isInterrupted) {
+                try {
+                    socket.accept().use {
+                        Log.d(TAG, "AirPlay: accepted connection from ${it.inetAddress}")
+                    }
+                } catch (e: IOException) {
+                    if (serverSocket != null) {
+                        Log.d(TAG, "AirPlay accept error (server still running): ${e.message}")
+                    }
                 }
             }
         }, "AirPlayServer").also { it.start() }
@@ -45,6 +47,7 @@ class AirPlayServer {
         } catch (e: IOException) {
             e.printStackTrace()
         } finally {
+            serverThread?.interrupt()
             serverSocket = null
             serverThread = null
         }

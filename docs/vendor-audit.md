@@ -2,7 +2,7 @@
 
 Receiver includes native code because the AirPlay/RAOP stack depends on protocol, crypto, AAC, and DNS-SD components that are not provided by Android as a single ready-made receiver library.
 
-This audit documents what is retained and what was removed while cleaning the repository for the Lenovo ThinkSmart View build.
+This audit documents what is retained and what was removed while cleaning the repository for the Android TV receiver build.
 
 ## Retained Components
 

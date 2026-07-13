@@ -29,6 +29,7 @@
 #include "fdk-aac/libFDK/include/clz.h"
 #include "fdk-aac/libSYS/include/FDK_audio.h"
 #include "stream.h"
+#include "alac/alac_decoder_wrapper.h"
 
 #define RAOP_BUFFER_LENGTH 64
 
@@ -58,6 +59,11 @@ struct raop_buffer_s {
     AES_CTX aes_ctx_audio;
 
     HANDLE_AACDECODER phandle;
+    alac_decoder_wrapper_t *alac_decoder;
+    raop_audio_config_t audio_config;
+    int pcm_pkt_size;
+    int alac_decode_errors;
+    int alac_decode_success_logged;
 
 	/* First and last seqnum */
 	int is_empty;
@@ -78,8 +84,6 @@ static int fdk_flags = 0;
 
 /* period size 480 samples */
 #define N_SAMPLE 480
-
-static int pcm_pkt_size = 4 * N_SAMPLE;
 
 HANDLE_AACDECODER
 create_fdk_aac_decoder(logger_t *logger)
@@ -109,6 +113,109 @@ create_fdk_aac_decoder(logger_t *logger)
             aac_stream_info->channelConfig, aac_stream_info->aacSampleRate,
            aac_stream_info->aacSamplesPerFrame, aac_stream_info->aot, aac_stream_info->bitRate);
     return phandle;
+}
+
+static int
+raop_buffer_set_audio_buffer_size(raop_buffer_t *raop_buffer, int audio_buffer_size)
+{
+    void *new_buffer;
+
+    if (!raop_buffer || audio_buffer_size <= 0) {
+        return -1;
+    }
+    if (raop_buffer->buffer && raop_buffer->buffer_size == audio_buffer_size * RAOP_BUFFER_LENGTH) {
+        for (int i = 0; i < RAOP_BUFFER_LENGTH; i++) {
+            raop_buffer_entry_t *entry = &raop_buffer->entries[i];
+            entry->audio_buffer_size = audio_buffer_size;
+            entry->audio_buffer = (char *)raop_buffer->buffer + i * audio_buffer_size;
+        }
+        return 0;
+    }
+
+    new_buffer = realloc(raop_buffer->buffer, audio_buffer_size * RAOP_BUFFER_LENGTH);
+    if (!new_buffer) {
+        return -1;
+    }
+    raop_buffer->buffer = new_buffer;
+    raop_buffer->buffer_size = audio_buffer_size * RAOP_BUFFER_LENGTH;
+    for (int i = 0; i < RAOP_BUFFER_LENGTH; i++) {
+        raop_buffer_entry_t *entry = &raop_buffer->entries[i];
+        entry->audio_buffer_size = audio_buffer_size;
+        entry->audio_buffer_len = 0;
+        entry->audio_buffer = (char *)raop_buffer->buffer + i * audio_buffer_size;
+    }
+    return 0;
+}
+
+int
+raop_buffer_configure_audio(raop_buffer_t *raop_buffer, const raop_audio_config_t *config)
+{
+    unsigned int output_bytes;
+
+    if (!raop_buffer || !config) {
+        return -1;
+    }
+
+    output_bytes = raop_audio_config_output_bytes(config);
+    if (output_bytes == 0) {
+        logger_log(raop_buffer->logger, LOGGER_ERR, "Invalid audio config: codec=%d sr=%u depth=%u channels=%u spf=%u",
+                   config->codec, config->sample_rate, config->bit_depth, config->channels, config->frames_per_packet);
+        return -1;
+    }
+
+    raop_buffer_flush(raop_buffer, -1);
+    if (raop_buffer_set_audio_buffer_size(raop_buffer, (int)output_bytes) < 0) {
+        logger_log(raop_buffer->logger, LOGGER_ERR, "Unable to resize audio buffer to %u bytes", output_bytes);
+        return -1;
+    }
+
+    if (config->codec == RAOP_AUDIO_CODEC_ALAC) {
+        if (raop_buffer->phandle) {
+            aacDecoder_Close(raop_buffer->phandle);
+            raop_buffer->phandle = NULL;
+        }
+        if (raop_buffer->alac_decoder) {
+            alac_decoder_wrapper_destroy(raop_buffer->alac_decoder);
+            raop_buffer->alac_decoder = NULL;
+        }
+        raop_buffer->alac_decoder = alac_decoder_wrapper_create(config->sample_rate,
+                                                                config->bit_depth,
+                                                                config->channels,
+                                                                config->frames_per_packet);
+        if (!raop_buffer->alac_decoder) {
+            logger_log(raop_buffer->logger, LOGGER_ERR, "ALAC decoder init failed, spf=%u, %u/%u/%u",
+                       config->frames_per_packet, config->sample_rate, config->bit_depth, config->channels);
+            return -1;
+        }
+        raop_buffer->audio_config = *config;
+        raop_buffer->pcm_pkt_size = (int)output_bytes;
+        raop_buffer->alac_decode_errors = 0;
+        raop_buffer->alac_decode_success_logged = 0;
+        logger_log(raop_buffer->logger, LOGGER_INFO, "ALAC decoder initialized, spf=%u, %u/%u/%u",
+                   config->frames_per_packet, config->sample_rate, config->bit_depth, config->channels);
+        return 0;
+    }
+
+    if (config->codec == RAOP_AUDIO_CODEC_AAC_ELD) {
+        if (raop_buffer->alac_decoder) {
+            alac_decoder_wrapper_destroy(raop_buffer->alac_decoder);
+            raop_buffer->alac_decoder = NULL;
+        }
+        if (!raop_buffer->phandle) {
+            raop_buffer->phandle = create_fdk_aac_decoder(raop_buffer->logger);
+            if (!raop_buffer->phandle) {
+                return -1;
+            }
+        }
+        raop_buffer->audio_config = *config;
+        raop_buffer->pcm_pkt_size = (int)output_bytes;
+        logger_log(raop_buffer->logger, LOGGER_INFO, "AAC-ELD decoder initialized, spf=%u, %u/%u/%u",
+                   config->frames_per_packet, config->sample_rate, config->bit_depth, config->channels);
+        return 0;
+    }
+
+    logger_log(raop_buffer->logger, LOGGER_ERR, "Unsupported audio codec config: %d", config->codec);
+    return -1;
 }
 
 void
@@ -146,7 +253,8 @@ raop_buffer_init(logger_t *logger,
                  const unsigned char *ecdh_secret)
 {
 	raop_buffer_t *raop_buffer;
-	int audio_buffer_size;
+	raop_audio_config_t default_config;
+	unsigned int audio_buffer_size;
 	assert(aeskey);
     assert(aesiv);
     assert(ecdh_secret);
@@ -157,26 +265,19 @@ raop_buffer_init(logger_t *logger,
     raop_buffer->logger = logger;
 
 	/* Allocate the output audio buffers */
-    audio_buffer_size = 480 * 2 * 2;
-    raop_buffer->phandle = create_fdk_aac_decoder(logger);
-    if (!raop_buffer->phandle) {
+	default_config = raop_audio_config_default_aac_eld();
+    audio_buffer_size = raop_audio_config_output_bytes(&default_config);
+    raop_buffer->audio_config = default_config;
+    raop_buffer->pcm_pkt_size = (int)audio_buffer_size;
+    if (raop_buffer_set_audio_buffer_size(raop_buffer, (int)audio_buffer_size) < 0) {
         free(raop_buffer);
         return NULL;
     }
-	raop_buffer->buffer_size = audio_buffer_size * RAOP_BUFFER_LENGTH;
-	raop_buffer->buffer = malloc(raop_buffer->buffer_size);
-	if (!raop_buffer->buffer) {
-        if (raop_buffer->phandle) {
-            free(raop_buffer->phandle);
-        }
+    raop_buffer->phandle = create_fdk_aac_decoder(logger);
+    if (!raop_buffer->phandle) {
+		free(raop_buffer->buffer);
 		free(raop_buffer);
 		return NULL;
-	}
-	for (int i=0; i<RAOP_BUFFER_LENGTH; i++) {
-		raop_buffer_entry_t *entry = &raop_buffer->entries[i];
-		entry->audio_buffer_size = audio_buffer_size;
-		entry->audio_buffer_len = 0;
-		entry->audio_buffer = (char *)raop_buffer->buffer+i*audio_buffer_size;
 	}
     raop_buffer_init_key_iv(raop_buffer, aeskey, aesiv, ecdh_secret);
 	/* Mark buffer as empty */
@@ -189,7 +290,12 @@ void
 raop_buffer_destroy(raop_buffer_t *raop_buffer)
 {
 	if (raop_buffer) {
-	    aacDecoder_Close(raop_buffer->phandle);
+	    if (raop_buffer->phandle) {
+            aacDecoder_Close(raop_buffer->phandle);
+        }
+        if (raop_buffer->alac_decoder) {
+            alac_decoder_wrapper_destroy(raop_buffer->alac_decoder);
+        }
 		free(raop_buffer->buffer);
 		free(raop_buffer);
 	}
@@ -318,20 +424,64 @@ raop_buffer_queue(raop_buffer_t *raop_buffer, unsigned char *data, unsigned shor
         fwrite(packetbuf, payloadsize, 1, file_aac);
     }
 #endif
-	// Aac decoding pcm
-    int ret = 0;
-    int pkt_size = payloadsize;
-    UINT valid_size = payloadsize;
-    UCHAR *input_buf[1] = {packetbuf};
-    ret = aacDecoder_Fill(raop_buffer->phandle, input_buf, &pkt_size, &valid_size);
-    if (ret != AAC_DEC_OK) {
-        logger_log(raop_buffer->logger, LOGGER_ERR, "aacDecoder_Fill error : %x", ret);
+    if (raop_buffer->audio_config.codec == RAOP_AUDIO_CODEC_ALAC) {
+        size_t decoded_bytes = 0;
+        uint32_t decoded_frames = 0;
+        uint32_t consumed_offset = 0;
+        int ret = alac_decoder_wrapper_decode(raop_buffer->alac_decoder,
+                                              packetbuf,
+                                              (size_t)payloadsize,
+                                              (uint8_t *)entry->audio_buffer,
+                                              (size_t)entry->audio_buffer_size,
+                                              &decoded_frames,
+                                              &decoded_bytes,
+                                              &consumed_offset);
+        if (ret == 0 && decoded_bytes > 0) {
+            entry->audio_buffer_len = (int)decoded_bytes;
+            if (!raop_buffer->alac_decode_success_logged) {
+                logger_log(raop_buffer->logger, LOGGER_INFO,
+                           "ALAC first frame decoded: payload=%d decoded=%d frames=%u offset=%u pts=%u",
+                           payloadsize, entry->audio_buffer_len, decoded_frames, consumed_offset, entry->timestamp);
+                raop_buffer->alac_decode_success_logged = 1;
+            }
+        } else {
+            entry->audio_buffer_len = entry->audio_buffer_size;
+            memset(entry->audio_buffer, 0, entry->audio_buffer_len);
+            if (raop_buffer->alac_decode_errors < 20) {
+                logger_log(raop_buffer->logger, LOGGER_ERR,
+                           "ALAC decode error %d: payload=%d pts=%u first_bytes=%02x %02x %02x %02x",
+                           ret,
+                           payloadsize,
+                           entry->timestamp,
+                           payloadsize > 0 ? packetbuf[0] : 0,
+                           payloadsize > 1 ? packetbuf[1] : 0,
+                           payloadsize > 2 ? packetbuf[2] : 0,
+                           payloadsize > 3 ? packetbuf[3] : 0);
+            }
+            raop_buffer->alac_decode_errors++;
+        }
+    } else {
+        // AAC-ELD decoding pcm
+        int ret = 0;
+        UINT pkt_size = payloadsize;
+        UINT valid_size = payloadsize;
+        UCHAR *input_buf[1] = {packetbuf};
+        if (!raop_buffer->phandle) {
+            raop_buffer->phandle = create_fdk_aac_decoder(raop_buffer->logger);
+        }
+        if (!raop_buffer->phandle) {
+            return -1;
+        }
+        ret = aacDecoder_Fill(raop_buffer->phandle, input_buf, &pkt_size, &valid_size);
+        if (ret != AAC_DEC_OK) {
+            logger_log(raop_buffer->logger, LOGGER_ERR, "aacDecoder_Fill error : %x", ret);
+        }
+        ret = aacDecoder_DecodeFrame(raop_buffer->phandle, entry->audio_buffer, raop_buffer->pcm_pkt_size, fdk_flags);
+        entry->audio_buffer_len = raop_buffer->pcm_pkt_size;
+        if (ret != AAC_DEC_OK) {
+            logger_log(raop_buffer->logger, LOGGER_ERR, "aacDecoder_DecodeFrame error : 0x%x", ret);
+        }
     }
-	ret = aacDecoder_DecodeFrame(raop_buffer->phandle, entry->audio_buffer, pcm_pkt_size, fdk_flags);
-	entry->audio_buffer_len = pcm_pkt_size;
-	if (ret != AAC_DEC_OK) {
-		logger_log(raop_buffer->logger, LOGGER_ERR, "aacDecoder_DecodeFrame error : 0x%x", ret);
-	}
 #ifdef DUMP_AUDIO
     if (file_pcm != NULL) {
         fwrite(entry->audio_buffer, entry->audio_buffer_len, 1, file_pcm);

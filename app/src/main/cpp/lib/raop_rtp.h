@@ -18,6 +18,7 @@
 /* For raop_callbacks_t */
 #include "raop.h"
 #include "logger.h"
+#include "raop_audio.h"
 
 #define RAOP_AESIV_LEN  16
 #define RAOP_AESKEY_LEN 16
@@ -33,6 +34,7 @@ raop_rtp_t *raop_rtp_init(logger_t *logger, raop_callbacks_t *callbacks, const u
 void raop_rtp_start_audio(raop_rtp_t *raop_rtp, int use_udp, unsigned short control_rport, unsigned short timing_rport,
                      unsigned short *control_lport, unsigned short *timing_lport, unsigned short *data_lport);
 
+int raop_rtp_configure_audio(raop_rtp_t *raop_rtp, const raop_audio_config_t *config);
 void raop_rtp_set_volume(raop_rtp_t *raop_rtp, float volume);
 void raop_rtp_set_metadata(raop_rtp_t *raop_rtp, const char *data, int datalen);
 void raop_rtp_set_coverart(raop_rtp_t *raop_rtp, const char *data, int datalen);

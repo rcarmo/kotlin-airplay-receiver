@@ -17,6 +17,7 @@
 
 #include "logger.h"
 #include "raop_rtp.h"
+#include "raop_audio.h"
 
 typedef struct raop_buffer_s raop_buffer_t;
 
@@ -32,5 +33,6 @@ const void *raop_buffer_dequeue(raop_buffer_t *raop_buffer, int *length, unsigne
 void raop_buffer_handle_resends(raop_buffer_t *raop_buffer, raop_resend_cb_t resend_cb, void *opaque);
 void raop_buffer_flush(raop_buffer_t *raop_buffer, int next_seq);
 void raop_buffer_destroy(raop_buffer_t *raop_buffer);
+int raop_buffer_configure_audio(raop_buffer_t *raop_buffer, const raop_audio_config_t *config);
 
 #endif

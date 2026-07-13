@@ -1,108 +1,138 @@
 # Receiver Performance Notes
 
-Receiver targets the Lenovo ThinkSmart View running Android 8.1/API 27 on an 8-inch 1280x800 WVA touchscreen. The performance goal is to keep receiver latency predictable on older hardware while letting the operator choose how aggressively Receiver keeps the display awake.
+AirPlay Receiver targets Android TV and Google TV devices. Performance work is focused on predictable playback, fast return to the ready screen, and avoiding UI behavior that competes with media decode from the couch.
 
-## Android 8.1 Constraints
+## Android TV Assumptions
 
-Android 8.1 is old enough that the app avoids newer platform APIs and keeps `minSdk` at 27. The media path uses APIs available on the ThinkSmart View:
+The app keeps `minSdk` at 27 for broad Android TV coverage, while targeting API 34 for Play readiness in this phase.
 
-- `SurfaceView` for direct proportional rendering
-- `MediaCodec` for H.264 decode
-- `AudioTrack.Builder` and low-latency performance mode for PCM output
-- JNI for the native RAOP, mirroring, AAC, crypto, and DNS-SD stack
+The media path uses:
 
-The UI layer is intentionally static after launch. The pre-connection controls sit on one centered pane and disappear when streaming begins. There are no animations, polling widgets, or settings controls competing with decode and audio playback during a stream.
+- `SurfaceView` for direct video composition.
+- `MediaCodec` for H.264 decode.
+- `AudioTrack` for PCM playback.
+- JNI direct buffers for native RAOP, mirroring, AAC, crypto, and DNS-SD interop.
+- A foreground service so Android treats the receiver as active while listening or playing.
 
-The app runs a small foreground service while active so Android treats Receiver as a foreground task. The startup screen exposes two stream resolution modes:
+The UI is remote-first. Remote volume keys control Android media volume, and the traffic monitor is toggled from the playback overlay. Onboarding, the default ready screen, and the active video overlay now use Compose as the first migration surfaces; playback remains a View-based `SurfaceView` path so media rendering is not disturbed by the UI migration.
 
-- `720p`: advertise 1280x720 and avoid extra decode/downscale work.
-- `1080p`: advertise 1920x1080 and downscale through the display surface.
+## Ready Screen
 
-The startup screen also exposes three display policies:
+The ready screen is intentionally simple:
 
-- `OS default`: no receiver wake lock or keep-screen-on window flag.
-- `Always awake`: sets keep-screen-on on the window, decor view, and playback surface, and holds a screen wake lock while Receiver is active.
-- `Wake on activity`: allows normal display sleep, then briefly refreshes a wake lock from throttled video packet activity and brings Receiver forward if focus was lost.
+- dark full-screen background
+- receiver name
+- `Ready to AirPlay`
+- short sender instructions
+- quality profile
+- security mode
+- D-pad actions for Settings, Quick Settings, and Help
 
-Video activity means decoded-stream packet traffic from the mirror path, throttled so the UI thread is not touched for every frame.
+It avoids network addresses, receiver IDs, and discovery internals. Diagnostics remain available through settings.
 
-The optional traffic monitor is hidden by default and rendered as a transparent overlay. It charts recent media throughput with adaptive `b/s`, `kb/s`, or `Mb/s` labels plus receiver-side latency from Kotlin packet receipt to the audio write or video render handoff. These latency numbers measure Receiver's local pipeline, not sender-to-display wall-clock latency, because the AirPlay timestamps available here are stream-relative.
+The current ready screen includes a clock with subtle pixel shifting. Reduce Motion disables movement. OLED dimming is implemented as UI-level dimming after a configurable idle interval so it does not depend on device-specific TV brightness APIs.
 
-The traffic monitor is intentionally modest:
+## Quality And Display
 
-- Throughput is counted from decoded media bytes crossing into Kotlin, not raw encrypted network bytes.
-- Latency starts when Kotlin receives a direct media buffer from JNI.
-- Audio latency stops when `AudioTrack.write` is called.
-- Video latency stops when `MediaCodec.releaseOutputBuffer(..., true)` hands the newest decoded output frame to the display surface.
-- The chart uses 30 rolling half-second samples, plots only completed samples, and avoids opaque backgrounds.
+Quality profiles map onto the existing AirPlay `/info` resolution plumbing:
 
-The startup pane remains visible while the receiver moves through setup, mirror negotiation, first media bytes, decoder startup, and first rendered frame. It disappears when the first decoded video frame is rendered, keeping the screen from going black while still exposing enough state to debug failed handshakes without log access.
+- Auto: choose 720p or 1080p based on display modes.
+- Low Latency: 720p.
+- Balanced: 1080p.
+- Best Quality: 1080p.
+- Compatibility: 720p.
+- Audio Stable: 720p.
 
-Audio is always advertised and accepted so sender negotiation stays simple. Receiver controls playback volume through Android's media stream volume.
+The video surface supports three fit modes:
 
-Receiver exits on explicit video/mirror stream teardown, or when the mirror media socket closes and no fresh media arrives during a short grace window. Audio-only teardown destroys the audio RTP session but leaves the app running so it can accept another stream. Receiver does not exit merely because media goes temporarily quiet, since static desktops and paused content can legitimately stop sending fresh frames for a while. Receiver also does not exit merely because the RTSP control socket closes, since some senders recycle that socket while a long-running mirror stream is still active.
+- Fit: preserve aspect ratio with no crop.
+- Fill: preserve aspect ratio and crop edges if needed.
+- Stretch: fill the display even when aspect ratio changes.
 
-Native mirror sessions are kept in a small active-session registry after RTSP control reconnects. This lets Receiver keep a constant stream alive while still joining mirror and timing threads during teardown, and caps malformed mirror payload sizes before they can grow native buffers unexpectedly.
+Fit is the default because it avoids distortion. Fill is useful when a user wants all TV pixels covered. Stretch exists for compatibility with unusual sender/display combinations.
 
-DNS-SD refreshes are idempotent. Launch and resume can both request announcements, but identical AirPlay and RAOP registrations are kept in place instead of being torn down and recreated while Android NSD callbacks are still pending.
-
-## Display And Decode
-
-The ThinkSmart View panel is 1280x800. AirPlay mirroring commonly arrives as a 1280x720 H.264 stream, so Receiver defaults to 720p mode, configures the decoder for 1280x720, and centers a 16:9 render surface on the 16:10 panel. On the target display this yields a 1280x720 video area with black bars above and below instead of vertical stretching.
-
-This keeps the decoder format aligned with the stream instead of pretending the incoming video is 1280x800. It also avoids CPU-side scaling in Kotlin. The optional 1080p mode advertises 1920x1080 through `/info`, configures `MediaCodec` for 1920x1080, and relies on `SurfaceView`/hardware composition to downscale into the visible 16:9 view. Receiver does not force an oversized `SurfaceHolder` buffer for 1080p because that can destabilize the older Android 8.1 display stack on the ThinkSmart View. That mode may improve source-side quality, but it is expected to cost more decode bandwidth and should be tested against the latency chart on the actual device. The video queue stays small, but it no longer drops arbitrary pending P-frames before decode. If the queue fills, Receiver waits briefly for decoder space; if a dependent frame still cannot be queued, it preserves the already queued chain, drops the overflow frame, and waits for the next keyframe so the decoder does not render frames whose references were discarded.
+Frame-rate matching is exposed as a setting and uses `Surface.setFrameRate()` on API 30+. `RaopServer` estimates common sender cadences from mirroring timestamps and falls back to 60 fps when timestamps are missing, unstable, or outside the supported range.
 
 ## Hot Path
 
-The hot path is:
+The hot path is unchanged in principle:
 
-1. Native socket and protocol handling receives encrypted audio/video data.
+1. Native sockets receive encrypted audio/video data.
 2. Native code decrypts and normalizes packets.
-3. JNI copies packet payloads into native-owned direct buffers and passes `ByteBuffer` views into Kotlin.
-4. Kotlin queues the direct buffer wrapper on the relevant playback thread.
-5. `VideoPlayer` copies video into `MediaCodec` input buffers; `AudioPlayer` writes direct PCM buffers to `AudioTrack`.
-6. The playback thread frees the native buffer as soon as the packet is written, decoded, or dropped.
+3. JNI copies packet payloads into native-owned direct buffers and passes `ByteBuffer` views to Kotlin.
+4. Kotlin queues the direct buffer wrapper on the playback thread.
+5. `VideoPlayer` copies video into `MediaCodec` input buffers.
+6. `AudioPlayer` writes direct PCM buffers to `AudioTrack`.
+7. Playback threads release native packet memory after write, decode, or drop.
 
-The Kotlin side does not parse protocol state in the hot path. It only receives decoded packet boundaries and hands them to Android playback primitives.
+The Kotlin side does not parse protocol state in the hot path. It hands packet boundaries to Android playback primitives.
 
 ## Latency Controls
 
-Receiver prefers dropping stale media over building delay:
+Receiver prefers recovering to live playback over building delay:
 
-- Video uses a tiny fixed-size `ArrayBlockingQueue` and feeds packetized H.264 directly to `MediaCodec`, matching the simple baseline startup path.
-- Decoded video output is drained aggressively; if several decoded frames are waiting, stale output buffers are discarded and only the newest one is rendered.
-- Traffic monitor aggregation is cheap enough to stay enabled, but the chart is only redrawn while the overlay is visible.
-- Audio uses a fixed-size `ArrayBlockingQueue` capped at 32 PCM packets, prebuffers 8 packets before playback starts, and trims backlog to 24 pending packets before enqueueing.
-- The native RAOP audio reorder buffer is capped at 64 packets, limiting how long playback can stall while waiting for a missing packet or resend.
-- Playback threads request Android's urgent display/audio thread priorities.
-- The H.264 decoder is configured with API 27-compatible priority and operating-rate hints.
-- Audio writes use blocking `AudioTrack` writes and a 4x platform buffer to reduce choppiness on the ThinkSmart View without letting optional audio build as much local latency as the earlier larger buffer.
-- Local volume control changes Android's media stream volume, so it follows the device's system audio path instead of only scaling the app's `AudioTrack`.
-- Decode and playback threads poll with short timeouts so shutdown is responsive.
-- Frame-level logging is behind `DEBUG_FRAMES = false`.
+- Video uses bounded queues sized for the known Android TV startup and decoder-restart path.
+- Codec config is preserved for decoder restarts.
+- Dependent video frames are kept in order before decode.
+- Stale decoded output is drained so the newest waiting frame is rendered.
+- Startup and render watchdogs only restart video decode when recent video packets are present; audio, feedback, or timing traffic alone is not treated as decoder progress.
+- Audio uses a bounded queue, conservative prebuffer, and blocking writes.
+- Queue pressure drops old audio packets instead of allowing unbounded delay.
+- Playback threads use urgent display/audio priorities.
+- Frame-level logging is disabled in normal builds.
 
-These choices are deliberate for an appliance receiver. If the device cannot keep up for a moment, recovering to live playback is better than playing an increasingly delayed stream.
+The audio sync setting is applied in `AudioPlayer`. Positive offsets write initial silence before the first packet; negative offsets drop initial PCM. Changing the value flushes and re-primes playback so behavior remains deterministic. The Audio Stable quality profile increases Kotlin-side queue headroom, prebuffering, and the platform buffer multiplier for underrun-prone routes.
+
+## Audio Route Awareness
+
+The playback overlay reports the current likely output route using Android output device information:
+
+- Bluetooth
+- HDMI / ARC
+- TV speakers
+- system output fallback
+
+The UI refreshes on route changes and warns on Bluetooth routes that audio sync may be needed. Route-specific persisted sync offsets remain future work because Android TV devices expose route identity inconsistently.
+
+## Audio-Only Visualizer
+
+The audio-only screen can show a simple bar visualizer driven by media byte samples. It is intentionally approximate, not a frequency analyzer:
+
+- low-RAM devices use fewer bars
+- samples are throttled
+- animation pauses when hidden
+- Reduce Motion keeps a quiet static display
+- the visualizer can be disabled in settings
+
+## Traffic Monitor
+
+The traffic monitor remains a diagnostic overlay. It charts recent media throughput and receiver-side packet latency:
+
+- Throughput is counted from decoded media bytes crossing into Kotlin.
+- Latency starts when Kotlin receives a direct media buffer from JNI.
+- Audio latency stops when `AudioTrack.write` is called.
+- Video latency stops when `MediaCodec.releaseOutputBuffer(..., true)` hands the output buffer to the display surface.
+
+These numbers measure receiver-side pressure, not sender capture latency or end-to-end AirPlay latency.
 
 ## Native Boundary
 
-JNI still requires copying payloads because the native RAOP/mirroring buffers are not owned by the Android playback queues after the callback returns. The bridge now copies into native-owned direct buffers instead of JVM arrays, which reduces Java heap churn and lets audio write through `AudioTrack.write(ByteBuffer, ...)`.
+JNI still copies payloads because native RAOP/mirroring buffers are not owned by Android playback queues after callback return. The direct-buffer bridge reduces Java heap churn while keeping ownership explicit.
 
-Video still needs one copy into `MediaCodec` input buffers. Removing that would require a deeper native media path or a decoder integration that owns input buffers directly. That should only be done after profiling on the actual ThinkSmart View.
+The build links shared native libraries with `-Wl,-z,max-page-size=16384` to prepare for Android devices using 16 KB memory pages. Release bundles include `arm64-v8a` for Play compliance and keep `armeabi-v7a` for Android TV devices that still expose a 32-bit userspace.
 
 ## Operational Guidance
 
-For best results on the target device:
+For best results:
 
-- Pick the stream resolution and display policy on the startup screen before connecting; both choices are remembered locally.
-- Audio is always accepted and advertised; use the volume control to adjust playback.
-- Swipe vertically from the right edge to adjust local audio volume while streaming.
-- Drag in from the top-right corner to show the traffic monitor; tap the monitor to hide it.
-- Expect Receiver to close when the sender disconnects; relaunch it from Android when the device should listen again.
-- Interpret traffic monitor latency as local receiver pressure. It is useful for spotting queue/decode stalls, but not for comparing sender capture or network delay.
-- The active receiver notification is expected while the app is running.
 - Use a stable wired or strong Wi-Fi network.
-- Avoid enabling verbose media logging during real playback.
+- Keep the TV and sender on the same local network.
+- Avoid guest Wi-Fi, VPNs, and router isolation when discovery is needed.
+- Start with Auto quality.
+- Use Low Latency or Compatibility if discovery works but playback is unstable.
+- Use Audio Stable if audio underruns are frequent.
+- Interpret traffic-monitor latency as local receiver pressure only.
 - Prefer release builds for device testing.
-- Profile on the ThinkSmart View itself before making larger native or decoder changes.
+- Test AAB output before Play submission.
 
-Useful checks on-device are dropped-frame behavior, audio drift, startup time to DNS-SD visibility, and whether reconnecting repeatedly leaves native sessions behind.
+Useful on-device checks are time to AirPlay picker visibility, first-frame time, reconnect behavior after disconnect, audio drift, Bluetooth route behavior, and whether repeated sessions leave native resources behind.
